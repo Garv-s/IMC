@@ -6,17 +6,19 @@ from typing import Dict, List, Tuple
 
 from datamodel import Order, OrderDepth, TradingState
 
+# Safe placeholder: change later when you learn official limits
+DEFAULT_POSITION_LIMIT = 20
+
 def best_bid_ask(depth: OrderDepth) -> Tuple[int | None, int | None, int | None, int | None]:
-    """Return (best_bid, best_bid_vol, best_ask, best_ask_vol)."""
     best_bid = None
     best_bid_vol = None
-    if getattr(depth, "buy_orders", None):
+    if depth.buy_orders:
         best_bid = max(depth.buy_orders.keys())
         best_bid_vol = depth.buy_orders[best_bid]
 
     best_ask = None
     best_ask_vol = None
-    if getattr(depth, "sell_orders", None):
+    if depth.sell_orders:
         best_ask = min(depth.sell_orders.keys())
         best_ask_vol = depth.sell_orders[best_ask]  # negative
 
@@ -61,26 +63,14 @@ class EMA:
 
 
 class Trader:
-    """Round-0: EMERALDS + TOMATOES.
-
-    v2 improvements vs basic EMA fair:
-      - Persist state via traderData (Lambda may be stateless)
-      - TOMATOES: add fast/slow EMA trend filter to avoid getting run over
-      - TOMATOES: volatility-aware quoting + inventory kill-switch
-      - EMERALDS: anchored quoting around 10000 with inventory skew
-
-    Returns: (orders_by_product, conversions:int, traderData:str)
-    """
-
     POSITION_LIMITS = {
-        "EMERALDS": 20,
-        "TOMATOES": 20,
+        "EMERALDS": DEFAULT_POSITION_LIMIT,
+        "TOMATOES": DEFAULT_POSITION_LIMIT,
     }
 
     def bid(self):
         return 15
 
-    # ---- traderData helpers ----
     def _load(self, traderData: str) -> dict:
         if not traderData:
             return {}
@@ -94,9 +84,8 @@ class Trader:
         s = json.dumps(obj, separators=(",", ":"))
         return s[:50000]
 
-    # ---- position helpers ----
     def _pos(self, state: TradingState, product: str) -> int:
-        return int(getattr(state, "position", {}).get(product, 0))
+        return int(state.position.get(product, 0))
 
     def _buy_cap(self, state: TradingState, product: str) -> int:
         lim = int(self.POSITION_LIMITS.get(product, 0))
@@ -107,7 +96,7 @@ class Trader:
         return max(0, lim + self._pos(state, product))
 
     def run(self, state: TradingState):
-        saved = self._load(getattr(state, "traderData", ""))
+        saved = self._load(state.traderData)
 
         # Restore TOMATOES state
         t_win = RollingWindow(window=50)
@@ -124,10 +113,10 @@ class Trader:
         result: Dict[str, List[Order]] = {}
         conversions = 0
 
-        for product, depth in getattr(state, "order_depths", {}).items():
+        for product, depth in state.order_depths.items():
             orders: List[Order] = []
-
             best_bid, best_bid_vol, best_ask, best_ask_vol = best_bid_ask(depth)
+
             if best_bid is None or best_ask is None:
                 result[product] = orders
                 continue
@@ -135,14 +124,11 @@ class Trader:
             mid = (best_bid + best_ask) / 2.0
 
             if product == "EMERALDS":
-                # Anchored fair value
-                fair = 10000
                 p = self._pos(state, product)
-
-                # Quote near fixed edges; skew to reduce inventory
                 skew = max(-6, min(6, p))
-                bid_px = 9992 - (skew // 2)  # if long -> lower bid
-                ask_px = 10008 - (skew // 2)  # if long -> lower ask (sell sooner)
+
+                bid_px = 9992 - (skew // 2)
+                ask_px = 10008 - (skew // 2)
 
                 q = 6
                 if self._buy_cap(state, product) > 0:
@@ -150,7 +136,7 @@ class Trader:
                 if self._sell_cap(state, product) > 0:
                     orders.append(Order(product, int(ask_px), -min(q, self._sell_cap(state, product))))
 
-                # Opportunistic taking if someone crosses our fair edges
+                # Take obvious edge if it appears
                 if best_ask <= 9992 and self._buy_cap(state, product) > 0:
                     qty = min(self._buy_cap(state, product), int(-best_ask_vol))
                     if qty > 0:
@@ -170,66 +156,59 @@ class Trader:
                 trend = fast - slow
 
                 vol = max(1.0, t_win.std())
+                p = self._pos(state, product)
+                lim = self.POSITION_LIMITS["TOMATOES"];
 
-                # Trend filter: if strong trend, avoid fading it
-                trend_k = 0.35  # in "price" units; tuned conservatively
+                # Soft trend regime (dynamic threshold)
+                trend_k = max(0.8, 0.35 * vol)
                 strong_down = trend < -trend_k
                 strong_up = trend > trend_k
 
-                p = self._pos(state, product)
+                # Shift fair slightly with trend (prevents hard fading)
+                fair_adj = fair + 0.5 * trend
 
-                # Inventory kill-switch in downtrend/uptrend
-                if strong_down and p > 0:
-                    # only try to reduce longs
-                    if self._sell_cap(state, product) > 0:
-                        px = max(int(best_bid), int(round(fair)))
-                        qty = min(self._sell_cap(state, product), min(10, p))
-                        if qty > 0:
-                            orders.append(Order(product, px, -qty))
-                    result[product] = orders
-                    continue
-
-                if strong_up and p < 0:
-                    # only try to reduce shorts
-                    if self._buy_cap(state, product) > 0:
-                        px = min(int(best_ask), int(round(fair)))
-                        qty = min(self._buy_cap(state, product), min(10, -p))
-                        if qty > 0:
-                            orders.append(Order(product, px, qty))
-                    result[product] = orders
-                    continue
-
-                # Taking threshold increases with vol and trend
-                take_k = 0.9 if (strong_down or strong_up) else 0.8
-
-                if best_ask < fair - take_k * vol and self._buy_cap(state, product) > 0 and not strong_down:
-                    qty = min(self._buy_cap(state, product), int(-best_ask_vol))
-                    if qty > 0:
-                        orders.append(Order(product, int(best_ask), int(qty)))
-
-                if best_bid > fair + take_k * vol and self._sell_cap(state, product) > 0 and not strong_up:
-                    qty = min(self._sell_cap(state, product), int(best_bid_vol))
-                    if qty > 0:
-                        orders.append(Order(product, int(best_bid), -int(qty)))
-
-                # Passive quoting around fair, widen with vol and trend
-                base_spread = max(2, int(round(0.7 * vol)))
-                # If trending, widen further and bias with trend direction
-                extra = 1 if (strong_down or strong_up) else 0
+                # Spread/size adapts in strong trend, but we keep quoting
+                base_spread = max(2, int(round(0.6 * vol)))
+                spread = base_spread + (2 if (strong_down or strong_up) else 0)
+                q = 6 if not (strong_down or strong_up) else 3
 
                 inv_skew = max(-8, min(8, p))
-                bid_px = int(round(fair - base_spread - extra - 0.25 * inv_skew))
-                ask_px = int(round(fair + base_spread + extra - 0.25 * inv_skew))
+                bid_px = int(round(fair_adj - spread - 0.25 * inv_skew))
+                ask_px = int(round(fair_adj + spread - 0.25 * inv_skew))
 
-                q = 6
-                if self._buy_cap(state, product) > 0:
+                # Be pickier when trading against strong trend
+                take_k_with = 0.8
+                take_k_against = 1.2
+
+                loaded_long = p > 0.6 * lim
+                loaded_short = p < -0.6 * lim
+
+                allow_buy = not (strong_down and loaded_long)
+                allow_sell = not (strong_up and loaded_short)
+
+                # Take
+                if self._buy_cap(state, product) > 0 and allow_buy:
+                    k = take_k_against if strong_down else take_k_with
+                    if best_ask < fair_adj - k * vol:
+                        qty = min(self._buy_cap(state, product), int(-best_ask_vol))
+                        if qty > 0:
+                            orders.append(Order(product, int(best_ask), int(qty)))
+
+                if self._sell_cap(state, product) > 0 and allow_sell:
+                    k = take_k_against if strong_up else take_k_with
+                    if best_bid > fair_adj + k * vol:
+                        qty = min(self._sell_cap(state, product), int(best_bid_vol))
+                        if qty > 0:
+                            orders.append(Order(product, int(best_bid), -int(qty)))
+
+                # Always keep passive quotes (no “turn off”)
+                if self._buy_cap(state, product) > 0 and allow_buy:
                     orders.append(Order(product, bid_px, min(q, self._buy_cap(state, product))))
-                if self._sell_cap(state, product) > 0:
+                if self._sell_cap(state, product) > 0 and allow_sell:
                     orders.append(Order(product, ask_px, -min(q, self._sell_cap(state, product))))
 
             result[product] = orders
 
-        # Persist
         traderData = self._dump(
             {
                 "t_ema": t_ema.value,
@@ -238,5 +217,4 @@ class Trader:
                 "t_win": list(t_win.values),
             }
         )
-
         return result, conversions, traderData
